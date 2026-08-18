@@ -1,0 +1,113 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+.venv/
+env/
+venv/
+vendor/
+zz/
+playlists_config.json
+
+# Local env files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.key
+
+# Testing
+coverage
+
+# Turbo
+.turbo
+
+# Vercel
+.vercel
+
+# Build Outputs
+.next/
+out/
+build
+dist
+dist/
+build/
+out/
+*.class
+*.pyc
+*.o
+
+# Debug and temporary
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+*.tmp
+Thumbs.db
+
+# Misc
+.DS_Store
+*.pem
+
+# Local settings
+settings.local.json
+
+# IDE configuration person
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Large file
+*.zip
+*.tar.gz
+*.7z
+
+
+
+
+# ===== 只传文件夹名，不传内容 =====
+A_待整理音乐/*
+
+# 但保留文件夹本身（Git会自动保留空目录结构）(注意：.gitkeep文件要写入文件夹，且一定要在更改.gitignore文件前完成！)
+!A_待整理音乐/.gitkeep
+
+# ===== Python通用忽略 =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+.spec
+
+# ===== 敏感信息 =====
+.env
+*.key
+*.pem
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== 大文件 =====
+*.mp3
+*.wav
+*.flac
+*.zip
+*.rar
+*.7z
