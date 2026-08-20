@@ -8,8 +8,6 @@ import time
 import random
 from pathlib import Path
 import pygame
-import shutil
-from PIL import Image, ImageTk, ImageDraw
 import mutagen
 from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
@@ -18,6 +16,9 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.mp4 import MP4
 import librosa
 import numpy as np
+import soundfile as sf
+import tempfile
+import hashlib
 
 
 class MusicPlayerCore:
@@ -29,116 +30,274 @@ class MusicPlayerCore:
         pygame.mixer.init()
         pygame.mixer.music.set_volume(0.8)
         self.current_file = None
+        self.current_processed_file = None
         self.is_playing = False
         self.is_paused = False
         self.volume = 80
-        self.play_mode = "sequential"  # sequential, random, single_loop
+        self.play_mode = "sequential"  # sequential, single_loop, random
         self.current_position = 0
         self.playlist = []
         self.current_index = -1
-        self.fade_out_duration = 3  # 滑音参数（秒）
+        self.fade_in_duration = 2   # 滑入参数（秒）
+        self.fade_out_duration = 3  # 滑出参数（秒）
         self._fade_thread = None
         self._stop_fade = False
         self.current_length = 0  # 缓存当前歌曲时长
         self._length_cache = {}  # 所有歌曲时长缓存
+        self._fade_lock = threading.Lock()
+        self._auto_next_timer = None
+        self._temp_dir = os.path.join(tempfile.gettempdir(), "music_player_temp")
+        self._ensure_temp_dir()
+
+    def _ensure_temp_dir(self):
+        """确保临时目录存在"""
+        if not os.path.exists(self._temp_dir):
+            os.makedirs(self._temp_dir)
+
+    def _get_temp_file_path(self, original_path, speed, pitch):
+        """根据原始文件路径和参数生成临时文件路径"""
+        param_str = f"{original_path}_{speed:.2f}_{pitch:.1f}"
+        hash_str = hashlib.md5(param_str.encode()).hexdigest()[:12]
+        return os.path.join(self._temp_dir, f"processed_{hash_str}.wav")
+
+    def _apply_audio_effects(self, file_path, speed=1.0, pitch=0):
+        """应用音频效果，返回处理后的文件路径"""
+        try:
+            # 如果速度和音调都是默认值，直接返回原文件
+            if abs(speed - 1.0) < 0.01 and abs(pitch) < 0.01:
+                return file_path, False
+            
+            # 生成临时文件路径
+            temp_file = self._get_temp_file_path(file_path, speed, pitch)
+            
+            # 如果临时文件已存在，直接使用
+            if os.path.exists(temp_file):
+                print(f"使用缓存的临时文件: {temp_file}")
+                return temp_file, True
+            
+            print(f"处理音频: {os.path.basename(file_path)}, 速度={speed}x, 音调={pitch}半音")
+            
+            # 加载音频
+            y, sr = librosa.load(file_path, sr=None)
+            
+            # 应用速度变化
+            if abs(speed - 1.0) > 0.01:
+                y = librosa.effects.time_stretch(y, rate=speed)
+            
+            # 应用音调变化
+            if abs(pitch) > 0.01:
+                y = librosa.effects.pitch_shift(y, sr=sr, n_steps=pitch)
+            
+            # 保存处理后的音频
+            sf.write(temp_file, y, sr)
+            print(f"已生成临时文件: {temp_file}")
+            
+            return temp_file, True
+            
+        except Exception as e:
+            print(f"音频处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return file_path, False
 
     def load(self, file_path):
         """加载音乐文件"""
         try:
-            self.stop()
-            time.sleep(0.1)
             pygame.mixer.music.load(file_path)
-            self.current_file = file_path
-            self.current_position = 0
             return True
         except Exception as e:
             print(f"加载失败: {e}")
             return False
     
-    def play(self, file_path=None, start_pos=0):
-        """播放音乐"""
+    def _fade_volume(self, from_vol, to_vol, duration, stop_event=None):
+        """通用滑音方法：在指定时间内从from_vol渐变到to_vol"""
+        steps = int(duration * 10)  # 每0.1秒一步
+        if steps <= 0:
+            steps = 1
+        
+        vol_step = (to_vol - from_vol) / steps
+        
+        for i in range(steps):
+            if stop_event and stop_event.is_set():
+                break
+            current_vol = from_vol + vol_step * (i + 1)
+            pygame.mixer.music.set_volume(max(0, min(100, current_vol)) / 100)
+            time.sleep(0.1)
+        
+        # 确保最终音量正确
+        pygame.mixer.music.set_volume(max(0, min(100, to_vol)) / 100)
+    
+    def play(self, file_path=None, start_pos=0, speed=1.0, pitch=0):
+        """播放音乐（带滑入效果，支持变速变调）"""
         try:
-            if file_path:
-                if not self.load(file_path):
-                    return False
+            # 取消之前的自动下一首定时器
+            self.cancel_auto_next()
             
-            if self.current_file:
-                # 从缓存获取时长
-                if self.current_file in self._length_cache:
-                    self.current_length = self._length_cache[self.current_file]
-                else:
-                    self.current_length = self.get_length()
-                    self._length_cache[self.current_file] = self.current_length
-                pygame.mixer.music.stop()
-                time.sleep(0.05)
-                pygame.mixer.music.load(self.current_file)
-                pygame.mixer.music.set_volume(self.volume / 100)
-                
-                if start_pos > 0:
-                    pygame.mixer.music.play(start=start_pos)
-                else:
-                    pygame.mixer.music.play()
-                
-                self.is_playing = True
-                self.is_paused = False
-                return True
-            return False
+            # 停止当前播放
+            self._hard_stop()
+            time.sleep(0.05)
+            
+            if file_path:
+                self.current_file = file_path
+                # 应用音频效果
+                processed_file, is_temp = self._apply_audio_effects(file_path, speed, pitch)
+                self.current_processed_file = processed_file if is_temp else None
+            elif not self.current_file:
+                return False
+            
+            # 确定实际播放的文件
+            actual_file = self.current_processed_file or self.current_file
+            
+            # 加载文件
+            if not self.load(actual_file):
+                return False
+            
+            # 从缓存获取时长
+            if self.current_file in self._length_cache:
+                self.current_length = self._length_cache[self.current_file]
+            else:
+                self.current_length = self._get_file_length(actual_file)
+                self._length_cache[self.current_file] = self.current_length
+            
+            # 设置初始音量为0（用于滑入）
+            pygame.mixer.music.set_volume(0)
+            
+            # 播放
+            # print(f"播放: {os.path.basename(actual_file)}, 起始: {start_pos}秒, 速度: {speed}x, 音调: {pitch}")
+            if start_pos > 0:
+                pygame.mixer.music.play(start=start_pos)
+            else:
+                pygame.mixer.music.play()
+            
+            self.is_playing = True
+            self.is_paused = False
+            
+            # 启动滑入线程
+            self._start_fade_in()
+            return True
         except Exception as e:
             print(f"播放失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
+    def _get_file_length(self, file_path):
+        """获取文件时长"""
+        try:
+            sound = pygame.mixer.Sound(file_path)
+            length = sound.get_length()
+            return length
+        except:
+            try:
+                audio = mutagen.File(file_path)
+                if audio and hasattr(audio, 'info'):
+                    return audio.info.length
+            except:
+                pass
+        return 0
+    
+    def _start_fade_in(self):
+        """启动滑入效果"""
+        self._stop_fade = False
+        target_volume = self.volume
+        
+        def fade_in():
+            try:
+                self._fade_volume(0, target_volume, self.fade_in_duration)
+            except Exception as e:
+                print(f"滑入失败: {e}")
+                # 失败时直接设置目标音量
+                pygame.mixer.music.set_volume(target_volume / 100)
+        
+        self._fade_thread = threading.Thread(target=fade_in, daemon=True)
+        self._fade_thread.start()
+    
     def pause(self):
-        """暂停播放（带滑音效果）"""
+        """暂停播放（带滑出效果）"""
         if self.is_playing and not self.is_paused:
             self._fade_out_and_pause()
     
     def _fade_out_and_pause(self):
-        """滑音后暂停"""
+        """滑出后暂停"""
         self._stop_fade = False
+        stop_event = threading.Event()
+        current_vol = self.volume
+        
         def fade_out():
             try:
-                current_vol = self.volume
-                steps = int(self.fade_out_duration * 10)
-                if steps <= 0:
-                    steps = 1
-                vol_step = current_vol / steps
+                self._fade_volume(current_vol, 0, self.fade_out_duration, stop_event)
                 
-                for i in range(steps):
-                    if self._stop_fade:
-                        break
-                    new_vol = current_vol - (vol_step * (i + 1))
-                    pygame.mixer.music.set_volume(max(0, new_vol) / 100)
-                    time.sleep(0.1)
-                
-                if not self._stop_fade:
+                if not stop_event.is_set():
                     pygame.mixer.music.pause()
                     self.is_paused = True
                     self.is_playing = False
+                    # 恢复音量设置（下次播放时会重新滑入）
                     pygame.mixer.music.set_volume(self.volume / 100)
             except Exception as e:
-                print(f"滑音暂停失败: {e}")
+                print(f"滑出暂停失败: {e}")
                 pygame.mixer.music.pause()
                 self.is_paused = True
                 self.is_playing = False
         
         self._fade_thread = threading.Thread(target=fade_out, daemon=True)
         self._fade_thread.start()
+        
+        # 保存stop_event以便取消
+        self._current_stop_event = stop_event
     
     def resume(self):
-        """恢复播放"""
+        """恢复播放（带滑入效果）"""
         self._stop_fade = True
+        if hasattr(self, '_current_stop_event'):
+            self._current_stop_event.set()
+        
         if self.is_paused:
             try:
-                pygame.mixer.music.set_volume(self.volume / 100)
+                pygame.mixer.music.set_volume(0)
                 pygame.mixer.music.unpause()
                 self.is_paused = False
                 self.is_playing = True
+                
+                # 启动滑入
+                self._start_fade_in()
             except:
                 pass
     
     def stop(self):
-        """停止播放"""
+        """停止播放（带滑出效果）"""
+        if self.is_playing or self.is_paused:
+            self._fade_out_and_stop()
+        else:
+            self._hard_stop()
+    
+    def _fade_out_and_stop(self):
+        """滑出后停止"""
+        self._stop_fade = False
+        stop_event = threading.Event()
+        current_vol = self.volume if self.is_playing else 0
+        
+        def fade_out():
+            try:
+                if self.is_playing:
+                    self._fade_volume(current_vol, 0, self.fade_out_duration, stop_event)
+                
+                if not stop_event.is_set():
+                    self._hard_stop()
+            except Exception as e:
+                print(f"滑出停止失败: {e}")
+                self._hard_stop()
+        
+        self._fade_thread = threading.Thread(target=fade_out, daemon=True)
+        self._fade_thread.start()
+        
+        # 保存stop_event以便取消
+        self._current_stop_event = stop_event
+    
+    def _hard_stop(self):
+        """硬停止（无滑音）"""
         self._stop_fade = True
+        if hasattr(self, '_current_stop_event'):
+            self._current_stop_event.set()
         try:
             pygame.mixer.music.stop()
             pygame.mixer.music.unload()
@@ -148,16 +307,27 @@ class MusicPlayerCore:
         self.is_paused = False
         self.current_position = 0
     
+    def cancel_auto_next(self):
+        """取消自动下一首定时器"""
+        if self._auto_next_timer:
+            self._auto_next_timer.cancel()
+            self._auto_next_timer = None
+    
+    def schedule_auto_next(self, delay, callback):
+        """安排自动下一首"""
+        self.cancel_auto_next()
+        self._auto_next_timer = threading.Timer(delay, callback)
+        self._auto_next_timer.daemon = True
+        self._auto_next_timer.start()
+    
     def set_volume(self, volume):
         """设置音量"""
         self.volume = max(0, min(100, volume))
-        try:
+        if self.is_playing and not self.is_paused:
             pygame.mixer.music.set_volume(self.volume / 100)
-        except:
-            pass
     
     def get_position(self):
-        """获取当前播放位置（秒）"""
+        """获取当前播放位置"""
         if self.is_playing or self.is_paused:
             try:
                 pos = pygame.mixer.music.get_pos()
@@ -168,74 +338,18 @@ class MusicPlayerCore:
         return 0
     
     def get_length(self):
-        """获取音乐长度（秒）- 使用缓存"""
-        if self.current_file in self._length_cache:
-            return self._length_cache[self.current_file]
-        
-        if self.current_file:
-            try:
-                sound = pygame.mixer.Sound(self.current_file)
-                length = sound.get_length()
-                self._length_cache[self.current_file] = length
-                return length
-            except:
-                try:
-                    import mutagen
-                    audio = mutagen.File(self.current_file)
-                    if audio and hasattr(audio, 'info'):
-                        length = audio.info.length
-                        self._length_cache[self.current_file] = length
-                        return length
-                except:
-                    pass
-        return 0
-        
-    def set_position(self, position):
-        """设置播放位置"""
-        if self.current_file and position >= 0:
-            try:
-                was_playing = self.is_playing or self.is_paused
-                pygame.mixer.music.stop()
-                time.sleep(0.05)
-                pygame.mixer.music.play(start=position)
-                pygame.mixer.music.set_volume(self.volume / 100)
-                if was_playing:
-                    self.is_playing = True
-                    self.is_paused = False
-                return True
-            except Exception as e:
-                print(f"设置位置失败: {e}")
-        return False
+        """获取音乐长度"""
+        return self.current_length
     
-    def next(self):
-        """下一首"""
-        if not self.playlist:
-            return None
-        
-        if self.play_mode == "random":
-            self.current_index = random.randint(0, len(self.playlist) - 1)
-        elif self.play_mode == "single_loop":
-            pass
-        else:  # sequential
-            self.current_index = (self.current_index + 1) % len(self.playlist)
-        
-        if self.current_index < len(self.playlist):
-            return self.playlist[self.current_index]
-        return None
-    
-    def previous(self):
-        """上一首"""
-        if not self.playlist:
-            return None
-        
-        if self.play_mode == "random":
-            self.current_index = random.randint(0, len(self.playlist) - 1)
-        else:
-            self.current_index = (self.current_index - 1) % len(self.playlist)
-        
-        if self.current_index < len(self.playlist):
-            return self.playlist[self.current_index]
-        return None
+    def clean_temp_files(self):
+        """清理临时文件"""
+        try:
+            if os.path.exists(self._temp_dir):
+                import shutil
+                shutil.rmtree(self._temp_dir)
+                print("临时文件已清理")
+        except Exception as e:
+            print(f"清理临时文件失败: {e}")
 
 
 class PlaylistManager:
@@ -351,14 +465,30 @@ class DanceMusicPlayer:
         # 歌曲配置存储
         self.song_configs = {}
         
+        # 加载歌曲配置
+        self.load_song_configs()
+        
+        # 定时器管理
+        self.timer_threads = []
+        
+        # BPM缓存
+        self.bpm_cache = {}
+        
         # 默认设置
         self.default_settings = {
             'start_time': 0,
             'play_duration': 0,  # 0表示完整播放
             'pause_duration': 0,
             'volume': 80,
+            'speed': 100,
+            'pitch': 0,
+            'fade_in_duration': 2,
             'fade_out_duration': 3
         }
+        
+        # 防止滑块事件循环的标志
+        self._updating_sliders = False
+        self._is_playing = False
         
         # 设置样式
         self.setup_styles()
@@ -371,17 +501,56 @@ class DanceMusicPlayer:
         # 初始化变量
         self.current_playlist = 1
         self.song_library_dir = None
-        self.is_dragging = False
-        self.drag_item = None
         self.progress_dragging = False
-        self._update_progress_flag = False  # 进度条更新标志
+        self._is_transitioning = False       # 防止重复过渡
+        self._auto_next_scheduled = False    # 防止重复调度
         
         self.setup_shortcuts()
         self.setup_drag_drop()
         
+        # 绑定窗口关闭事件
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
         # 启动进度更新线程
         self.update_progress_thread()
-        
+    
+    def load_song_configs(self):
+        """加载歌曲配置"""
+        try:
+            config_file = "song_configs.json"
+            if os.path.exists(config_file):
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    self.song_configs = json.load(f)
+        except Exception as e:
+            print(f"加载歌曲配置失败: {e}")
+            self.song_configs = {}
+    
+    def save_song_configs(self):
+        """保存歌曲配置"""
+        try:
+            config_file = "song_configs.json"
+            # 深拷贝避免递归
+            configs_to_save = {}
+            for key, value in self.song_configs.items():
+                if isinstance(value, dict):
+                    configs_to_save[key] = {k: v for k, v in value.items() 
+                                           if not callable(v) and not hasattr(v, '__dict__')}
+                else:
+                    configs_to_save[key] = value
+            
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(configs_to_save, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存歌曲配置失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def on_closing(self):
+        """窗口关闭事件"""
+        self.save_song_configs()
+        self.player.clean_temp_files()
+        self.root.destroy()
+    
     def setup_styles(self):
         """设置界面样式"""
         style = ttk.Style()
@@ -407,7 +576,8 @@ class DanceMusicPlayer:
         file_menu.add_command(label="灯光控制", command=self.show_light_control)
         file_menu.add_command(label="设置", command=self.show_settings)
         file_menu.add_separator()
-        file_menu.add_command(label="退出", command=self.root.quit)
+        file_menu.add_command(label="清理临时文件", command=self.clean_temp_files)
+        file_menu.add_command(label="退出", command=self.on_closing)
         
         # 播放菜单
         play_menu = tk.Menu(menubar, tearoff=0)
@@ -506,29 +676,9 @@ class DanceMusicPlayer:
         self.progress_bar = ttk.Progressbar(progress_frame, length=400, mode='determinate')
         self.progress_bar.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
         
-        # # 进度条（带拖动块）
-        # self.progress_var = tk.DoubleVar()
-        # self.progress_scale = tk.Scale(progress_frame, from_=0, to=100, 
-        #                               orient=tk.HORIZONTAL, 
-        #                               variable=self.progress_var,
-        #                               bg='#ecf0f1', highlightthickness=0,
-        #                               showvalue=False,
-        #                               command=self.on_progress_change)
-        # self.progress_scale.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # # 绑定进度条事件
-        # self.progress_scale.bind('<ButtonPress-1>', self.on_progress_press)
-        # self.progress_scale.bind('<ButtonRelease-1>', self.on_progress_release)
-        
-        # 总时间标签
         self.total_time_label = tk.Label(progress_frame, text="00:00", 
                                         bg='#ecf0f1', font=('微软雅黑', 10))
         self.total_time_label.pack(side=tk.LEFT, padx=5)
-        
-        # # 百分比标签
-        # self.percent_label = tk.Label(progress_frame, text="0%", 
-        #                              bg='#ecf0f1', font=('微软雅黑', 10), width=5)
-        # self.percent_label.pack(side=tk.LEFT, padx=5)
         
         # 右侧：音量调节
         volume_frame = tk.Frame(control_frame, bg='#ecf0f1')
@@ -622,7 +772,7 @@ class DanceMusicPlayer:
     def create_song_table_in_container(self, container):
         """在指定容器中创建舞曲编排表格"""
         columns = ('序号', '播放时间', '歌名', '歌曲时长', '起始时间', 
-                '播放时长', '停顿时长', '音量', '灯光')
+                '播放时长', '停顿时长', '音量', '速度', '音调', '灯光')
         
         self.song_table = ttk.Treeview(container, columns=columns, show='headings', height=15)
         
@@ -633,12 +783,14 @@ class DanceMusicPlayer:
         # 设置列宽
         self.song_table.column('序号', width=15, anchor='center')
         self.song_table.column('播放时间', width=50, anchor='center')
-        self.song_table.column('歌名', width=570, anchor='w')
+        self.song_table.column('歌名', width=450, anchor='w')
         self.song_table.column('歌曲时长', width=50, anchor='center')
         self.song_table.column('起始时间', width=50, anchor='center')
         self.song_table.column('播放时长', width=50, anchor='center')
         self.song_table.column('停顿时长', width=50, anchor='center')
         self.song_table.column('音量', width=30, anchor='center')
+        self.song_table.column('速度', width=30, anchor='center')
+        self.song_table.column('音调', width=30, anchor='center')
         self.song_table.column('灯光', width=20, anchor='center')
         # 添加垂直滚动条
         table_vscrollbar = ttk.Scrollbar(container, orient="vertical", 
@@ -655,14 +807,10 @@ class DanceMusicPlayer:
         # 配置网格权重
         container.grid_rowconfigure(0, weight=1)
         container.grid_columnconfigure(0, weight=1)
-        
-        # 绑定鼠标点击事件
-        # self.song_listbox.bind('<<ListboxSelect>>', self.on_song_select)
+        # 绑定鼠标点击事件        
         self.song_table.bind('<Double-1>', self.on_table_double_click)
         self.song_table.bind('<Button-3>', self.show_table_context_menu)
-        # self.song_table.bind('<ButtonPress-1>', self.on_drag_start)
-        # self.song_table.bind('<ButtonRelease-1>', self.on_drag_end)
-        # self.song_table.bind('<B1-Motion>', self.on_drag_motion)
+        self.song_table.bind('<<TreeviewSelect>>', self.on_song_select)
 
     def create_audio_controls(self, container):
         """创建音频控制"""
@@ -696,7 +844,7 @@ class DanceMusicPlayer:
         # 👇 新增：为音频调节绑定右键菜单
         tempo_frame.bind('<Button-3>', self.show_tempo_context_menu)
 
-        # 节拍滑块 - 使用 ttk
+        # 节拍滑块
         tk.Label(tempo_frame, text="节拍", bg='white').pack(anchor='c', pady=(0, 0))
         self.beat_slider = ttk.Scale(tempo_frame, from_=30, to=150,
                                     orient=tk.HORIZONTAL,
@@ -802,7 +950,6 @@ class DanceMusicPlayer:
         self.status_label = tk.Label(self.status_frame, text="就绪", 
                                 bg='#2c3e50', fg='white',
                                 font=('微软雅黑', 10))
-
         self.status_label.pack(side=tk.RIGHT, padx=10)
         
         # 更新时间
@@ -829,32 +976,26 @@ class DanceMusicPlayer:
         except:
             pass
     
-    # ==================== 进度条事件处理 ====================
+    # ==================== 歌曲选择事件 ====================
     
-    def on_progress_press(self, event):
-        """进度条按下事件"""
-        self.progress_dragging = True
-    
-    def on_progress_release(self, event):
-        """进度条释放事件"""
-        if self.progress_dragging and self.player.current_file:
-            value = self.progress_var.get()
-            total_length = self.player.get_length()
-            if total_length > 0:
-                position = (value / 100) * total_length
-                self.player.set_position(position)
-                self.status_label.config(text=f"跳转到: {self.format_time(position)}")
-        self.progress_dragging = False
-    
-    def on_progress_change(self, value):
-        """进度条值改变事件"""
-        if self.player.current_file and self.progress_dragging:
-            value_float = float(value)
-            total_length = self.player.get_length()
-            if total_length > 0:
-                position = (value_float / 100) * total_length
-                self.current_time_label.config(text=self.format_time(position))
-                self.percent_label.config(text=f"{int(value_float)}%")
+    def on_song_select(self, event):
+        """歌曲选择事件 - 更新速度音调滑块"""
+        if self._updating_sliders:
+            return
+            
+        song_path = self.get_selected_song_path()
+        if song_path:
+            config = self.song_configs.get(song_path, {})
+            speed = config.get('speed', self.default_settings['speed'])
+            pitch = config.get('pitch', self.default_settings['pitch'])
+            volume = config.get('volume', self.default_settings['volume'])
+            
+            # 更新滑块位置（不触发事件）
+            self._updating_sliders = True
+            self.speed_slider.set(speed)
+            self.pitch_slider.set(pitch)
+            self.volume_scale.set(volume)
+            self._updating_sliders = False
     
     # ==================== 音频控制事件 ====================
     
@@ -866,10 +1007,23 @@ class DanceMusicPlayer:
     
     def reset_tempo(self):
         """重置音频调节"""
-        self.beat_slider.set(100)
+        self._updating_sliders = True
+        self.beat_slider.set(90)
         self.speed_slider.set(100)
         self.pitch_slider.set(0)
+        self._updating_sliders = False
         self.status_label.config(text="音频调节已重置")
+        
+        # 重置当前选中歌曲的速度音调配置
+        song_path = self.get_selected_song_path()
+        if song_path:
+            if song_path in self.song_configs:
+                if 'speed' in self.song_configs[song_path]:
+                    del self.song_configs[song_path]['speed']
+                if 'pitch' in self.song_configs[song_path]:
+                    del self.song_configs[song_path]['pitch']
+                self.save_song_configs()
+                self.load_playlist(self.current_playlist)
     
     def on_eq_change(self, index, value):
         """均衡器改变事件"""
@@ -877,15 +1031,91 @@ class DanceMusicPlayer:
     
     def on_beat_change(self, value):
         """节拍改变事件"""
+        if self._updating_sliders:
+            return
+        beat = round(float(value))
         self.status_label.config(text=f"节拍: {round(float(value))}")
     
+    def get_selected_song_path(self):
+        """获取当前选中歌曲的路径"""
+        selection = self.song_table.selection()
+        if selection:
+            item = selection[0]
+            values = self.song_table.item(item, 'values')
+            song_index = int(values[0]) - 1
+            songs = self.playlist_manager.playlists[self.current_playlist]["songs"]
+            if song_index < len(songs):
+                return songs[song_index]
+        return None
+    
     def on_speed_change(self, value):
-        """速度改变事件"""
-        self.status_label.config(text=f"速度: {round(float(value))/100:.1f}")
+        """速度改变事件 - 应用于当前选中歌曲"""
+        if self._updating_sliders:
+            return
+            
+        speed = round(float(value))
+        song_path = self.get_selected_song_path()
+        
+        if song_path:
+            if song_path not in self.song_configs:
+                self.song_configs[song_path] = {}
+            self.song_configs[song_path]['speed'] = speed
+            self.save_song_configs()
+            self.status_label.config(text=f"速度: {round(float(value))/100:.1f}")
+            
+            # 更新表格
+            self.update_song_table_row(song_path, 'speed', speed)
+            
+            # 如果正在播放这首歌，重新播放
+            if self.player.current_file == song_path and self.player.is_playing:
+                current_pos = self.player.get_position()
+                self.play_song_by_index(self.player.current_index, start_pos=current_pos)
+        else:
+            self.status_label.config(text="请先选择一首歌曲")
     
     def on_pitch_change(self, value):
-        """音调改变事件"""
-        self.status_label.config(text=f"音调: {round(float(value))}")
+        """音调改变事件 - 应用于当前选中歌曲"""
+        if self._updating_sliders:
+            return
+            
+        pitch = round(float(value))
+        song_path = self.get_selected_song_path()
+        
+        if song_path:
+            if song_path not in self.song_configs:
+                self.song_configs[song_path] = {}
+            self.song_configs[song_path]['pitch'] = pitch
+            self.save_song_configs()
+            self.status_label.config(text=f"音调: {round(float(value))}")
+            
+            # 更新表格
+            self.update_song_table_row(song_path, 'pitch', pitch)
+            
+            # 如果正在播放这首歌，重新播放
+            if self.player.current_file == song_path and self.player.is_playing:
+                current_pos = self.player.get_position()
+                self.play_song_by_index(self.player.current_index, start_pos=current_pos)
+        else:
+            self.status_label.config(text="请先选择一首歌曲")
+    
+    def update_song_table_row(self, song_path, field, value):
+        """更新表格中指定歌曲的某个字段"""
+        songs = self.playlist_manager.playlists[self.current_playlist]["songs"]
+        items = self.song_table.get_children()
+        
+        for i, item in enumerate(items):
+            if i < len(songs) and songs[i] == song_path:
+                values = list(self.song_table.item(item, 'values'))
+                
+                col_map = {
+                    'speed': 8,
+                    'pitch': 9,
+                }
+                
+                if field in col_map:
+                    values[col_map[field]] = str(value)
+                    self.song_table.item(item, values=values)
+                break
     
     # ==================== 音量快捷键 ====================
     
@@ -1063,10 +1293,11 @@ class DanceMusicPlayer:
     
     # ==================== 播放控制功能 ====================
     
-    def play_song_by_index(self, song_index):
+    def play_song_by_index(self, song_index, start_pos=None):
         """根据索引播放歌曲（应用配置）"""
         songs = self.playlist_manager.playlists[self.current_playlist]["songs"]
         if song_index < 0 or song_index >= len(songs):
+            print(f"无效的歌曲索引: {song_index}")
             return
         
         # 设置播放列表
@@ -1087,20 +1318,55 @@ class DanceMusicPlayer:
         # 获取歌曲路径和配置
         file_path = songs[song_index]
         config = self.song_configs.get(file_path, {})
+        
+        # 获取歌曲配置参数, 如果没有配置播放时长，使用歌曲总时长减去起始时间
+        if start_pos is not None:
+            actual_start_pos = start_pos
+        else:
+            actual_start_pos = config.get('start_time', self.default_settings['start_time'])
+        
+        # 获取歌曲总时长
+        total_duration = self.get_audio_duration_seconds(file_path)
+        
+        # 计算实际播放时长
+        if 'play_duration' in config and config['play_duration'] > 0:
+            # 用户设置了播放时长，使用设置值
+            play_duration = config['play_duration']
+        else:
+            # 没有设置或设置无效，使用歌曲剩余时长（总时长-起始时间）
+            play_duration = max(0, total_duration - actual_start_pos)
+        
+        pause_duration = config.get('pause_duration', self.default_settings['pause_duration'])
+        volume = config.get('volume', self.default_settings['volume'])
+        speed = config.get('speed', self.default_settings['speed'])
+        pitch = config.get('pitch', self.default_settings['pitch'])
+        fade_in_duration = config.get('fade_in_duration', self.default_settings['fade_in_duration'])
+        fade_out_duration = config.get('fade_out_duration', self.default_settings['fade_out_duration'])
+        
+        # 速度转换为倍率
+        speed_ratio = speed / 100.0
+        
+        self._auto_next_scheduled = False
 
-        # 获取歌曲配置
-        start_time = config.get('start_time', 0)
-        play_duration = config.get('play_duration', 0)
-        volume = config.get('volume', self.player.volume)
-        pause_duration = config.get('pause_duration', 0)
-        
-        # 设置音量
+        # 设置播放器参数
         self.player.set_volume(volume)
-        self.volume_scale.set(volume)
+        self.player.fade_in_duration = fade_in_duration
+        self.player.fade_out_duration = fade_out_duration
         
-        # 播放
-        if self.player.play(file_path, start_pos=start_time):
-            self.player.playlist = songs
+        # 更新滑块（不触发事件）
+        self._updating_sliders = True
+        self.volume_scale.set(volume)
+        self.speed_slider.set(speed)
+        self.pitch_slider.set(pitch)
+        self._updating_sliders = False
+        
+    #    print(f"播放: {os.path.basename(file_path)}, 起始: {actual_start_pos}秒, "
+    #           f"播放时长: {play_duration}秒, 停顿: {pause_duration}秒, "
+    #           f"速度: {speed}%, 音调: {pitch}")
+        
+        # 播放（带变速变调）
+        if self.player.play(file_path, start_pos=actual_start_pos, 
+                           speed=speed_ratio, pitch=pitch):
             self.player.current_index = song_index
             self.status_label.config(text=f"正在播放: {os.path.basename(file_path)}")
             self.update_status_position()
@@ -1108,30 +1374,31 @@ class DanceMusicPlayer:
             self.show_metadata(file_path)
             self.highlight_playing_song()
             
-            # 如果设置了播放时长，启动定时器
-            if play_duration > 0:
-                self.start_play_duration_timer(play_duration)
+            # 设置进度条总时长（使用播放时长而不是歌曲时长）
+            self.player.current_length = play_duration
             
-            # 如果设置了停顿时长，启动停顿定时器
-            if pause_duration > 0:
-                self.start_pause_timer(pause_duration)
+            # 安排自动播放下一首
+            total_wait_time = play_duration + pause_duration + fade_out_duration
+            self.schedule_auto_next(total_wait_time)
     
-    def start_play_duration_timer(self, duration):
-        """启动播放时长定时器"""
-        def timer():
-            time.sleep(duration)
+    def schedule_auto_next(self, delay):
+        """安排自动播放下一首"""
+        if self._auto_next_scheduled:
+            return
+        
+        self._auto_next_scheduled = True
+        
+        def auto_next():
+            print(f"自动播放下一首，延迟: {delay}秒")
+            self._auto_next_scheduled = False
             if self.player.is_playing:
                 self.root.after(0, self.next_song)
-        threading.Thread(target=timer, daemon=True).start()
-    
-    def start_pause_timer(self, duration):
-        """启动停顿定时器"""
-        def timer():
-            time.sleep(duration)
-            if self.player.is_playing:
-                self.root.after(0, self.pause_music)
-        threading.Thread(target=timer, daemon=True).start()
-    
+        
+        timer = threading.Timer(delay, auto_next)
+        timer.daemon = True
+        timer.start()
+        self.timer_threads.append(timer)
+
     def play_music(self):
         """播放音乐"""
         selection = self.song_table.selection()
@@ -1139,20 +1406,57 @@ class DanceMusicPlayer:
             item = selection[0]
             values = self.song_table.item(item, 'values')
             song_index = int(values[0]) - 1
-            self.play_song_by_index(song_index)
+            
+            if self._is_transitioning:
+                return
+            
+            # 如果当前有音乐在播放，先带滑音停止
+            if self.player.is_playing or self.player.is_paused:
+                self._transition_to_song(song_index)
+            else:
+                self.play_song_by_index(song_index)
     
+    def _transition_to_song(self, song_index):
+        if self._is_transitioning:
+            return
+        
+        self._is_transitioning = True
+
+        """平滑过渡到指定歌曲"""
+        def do_transition():
+            try:
+                # 停止当前播放（带滑出）
+                self.player.stop()
+                # 等待滑出完成
+                time.sleep(self.player.fade_out_duration)
+                # 播放新歌曲（带滑入）
+                self.root.after(0, lambda: self._finish_transition(song_index))
+            except Exception as e:
+                print(f"过渡失败: {e}")
+                self._is_transitioning = False
+        
+        threading.Thread(target=do_transition, daemon=True).start()
+    
+    def _finish_transition(self, song_index):
+        self.play_song_by_index(song_index)
+        self._is_transitioning = False
+
     def pause_music(self):
-        """暂停音乐"""
+        """暂停音乐（带滑音）"""
         if self.player.is_playing:
-            self.player.pause()
+            self.player.pause()  # 带滑音暂停,假设player.pause()内部已经处理了滑音
             self.status_label.config(text="暂停")
         elif self.player.is_paused:
             self.player.resume()
             self.status_label.config(text="继续播放")
     
     def stop_music(self):
-        """停止音乐"""
-        self.player.stop()
+        """停止音乐（带滑音）"""
+        self._auto_next_scheduled = False
+        self.player.cancel_auto_next()
+        
+        if self.player.is_playing or self.player.is_paused:
+            self.player.stop()  # 带滑音停止,假设player.stop()内部已经处理了滑音
         self.status_label.config(text="停止播放")
         self.progress_bar['value'] = 0
         self.current_time_label.config(text="00:00")
@@ -1162,6 +1466,9 @@ class DanceMusicPlayer:
         
     def previous_song(self):
         """上一首"""
+        if self._is_transitioning:
+            return
+            
         songs = self.playlist_manager.playlists[self.current_playlist]["songs"]
         if not songs:
             return
@@ -1171,10 +1478,18 @@ class DanceMusicPlayer:
             self.player.current_index = 0
         
         self.player.current_index = (self.player.current_index - 1) % len(songs)
-        self.play_song_by_index(self.player.current_index)
-    
+        
+        # 使用统一的过渡方法
+        if self.player.is_playing or self.player.is_paused:
+            self._transition_to_song(self.player.current_index)
+        else:
+            self.play_song_by_index(self.player.current_index)
+
     def next_song(self):
         """下一首（自动播放）"""
+        if self._is_transitioning:
+            return
+            
         songs = self.playlist_manager.playlists[self.current_playlist]["songs"]
         if not songs:
             return
@@ -1188,9 +1503,13 @@ class DanceMusicPlayer:
                 self.player.current_index = 0
         else:  # sequential
             self.player.current_index = (self.player.current_index + 1) % len(songs)
-        
-        self.play_song_by_index(self.player.current_index)
-    
+
+        # 使用统一的过渡方法
+        if self.player.is_playing or self.player.is_paused:
+            self._transition_to_song(self.player.current_index)
+        else:
+            self.play_song_by_index(self.player.current_index)
+                     
     def highlight_playing_song(self):
         """高亮当前播放的歌曲"""
         if self.player.current_index >= 0:
@@ -1210,25 +1529,19 @@ class DanceMusicPlayer:
     
     def change_volume(self, value):
         """改变音量"""
+        if self._updating_sliders:
+            return
+            
         volume = int(float(value))
         self.player.set_volume(volume)
         
-        if self.player.current_file:
-            if self.player.current_file not in self.song_configs:
-                self.song_configs[self.player.current_file] = {}
-            self.song_configs[self.player.current_file]['volume'] = volume
-
-    def on_progress_drag(self, value):
-        """进度条拖动事件"""
-        if self.player.current_file:
-            total_length = self.player.get_length()
-            if total_length > 0:
-                position = (float(value) / 100) * total_length
-                self.player.set_position(position)
-                # 更新播放状态
-                self.player.is_playing = True
-                self.player.is_paused = False
-                self.status_time_display_label.config(text=f"{self.format_time(position)} / {self.format_time(total_length)}")
+        # 保存到当前选中歌曲的配置
+        song_path = self.get_selected_song_path()
+        if song_path:
+            if song_path not in self.song_configs:
+                self.song_configs[song_path] = {}
+            self.song_configs[song_path]['volume'] = volume
+            self.save_song_configs()
 
     def update_progress_thread(self):
         """更新进度条线程"""
@@ -1244,14 +1557,10 @@ class DanceMusicPlayer:
                             if progress <= 100:
                                 self.root.after(0, self.update_progress_bar, 
                                             current_pos, total_length, progress)
-                            
-                            # 检查是否播放完毕，自动播放下一首
-                            if current_pos >= total_length and current_pos > 0:
-                                self.root.after(0, self.next_song)
                     except Exception as e:
                         print(f"进度更新错误: {e}")
                 
-                time.sleep(0.5)  
+                time.sleep(0.5)
         
         thread = threading.Thread(target=update, daemon=True)
         thread.start()    
@@ -1282,21 +1591,9 @@ class DanceMusicPlayer:
         self.current_playlist = playlist_num
         playlist_data = self.playlist_manager.playlists[playlist_num]
         
-        # 清空歌曲列表
-        # self.song_listbox.delete(0, tk.END)
-        
-        # 更新当前播放列表标签
-        # self.current_playlist_label.config(text=f"当前: {playlist_data['name']}")
-        
-        # 清空表格
         for item in self.song_table.get_children():
             self.song_table.delete(item)
-        
-        # 添加歌曲到列表
-        for song in playlist_data["songs"]:
-            song_name = os.path.basename(song)
-            # self.song_listbox.insert(tk.END, song_name)
-        
+
         # 更新表格
         self.update_song_table(playlist_data["songs"])
         
@@ -1320,9 +1617,19 @@ class DanceMusicPlayer:
             
             config = self.song_configs.get(song_path, {})
             start_time = config.get('start_time', self.default_settings['start_time'])
-            play_duration = config.get('play_duration', duration_seconds if not self.default_settings['play_duration'] else self.default_settings['play_duration'])
+            
+            # 计算显示用的播放时长
+            if 'play_duration' in config and config['play_duration'] > 0:
+                # 用户设置了播放时长，显示设置值
+                play_duration = config['play_duration']
+            else:
+                # 没有设置，显示歌曲剩余时长
+                play_duration = max(0, duration_seconds - start_time)
+            
             pause_duration = config.get('pause_duration', self.default_settings['pause_duration'])
             volume = config.get('volume', self.default_settings['volume'])
+            speed = config.get('speed', self.default_settings['speed'])
+            pitch = config.get('pitch', self.default_settings['pitch'])
             light = config.get('light', '')
             
             play_time = self.calculate_play_time(i, songs)
@@ -1336,12 +1643,14 @@ class DanceMusicPlayer:
                 self.format_time(play_duration),
                 self.format_time(pause_duration),
                 str(volume),
+                str(speed),
+                str(pitch),
                 light
             )
             self.song_table.insert('', 'end', values=row)
     
     def calculate_play_time(self, index, songs):
-        """计算预计播放时间"""
+        """计算预计播放时间（使用播放时长和停顿时长）"""
         now = datetime.datetime.now()
         total_seconds = 0
         
@@ -1352,8 +1661,16 @@ class DanceMusicPlayer:
                 if i < len(songs):
                     duration = self.get_audio_duration_seconds(songs[i])
                     config = self.song_configs.get(songs[i], {})
-                    pause_duration = config.get('pause_duration', 0)
-                    total_seconds += duration + pause_duration
+                    start_time = config.get('start_time', self.default_settings['start_time'])
+                    
+                    # 计算实际播放时长
+                    if 'play_duration' in config and config['play_duration'] > 0:
+                        play_duration = config['play_duration']
+                    else:
+                        play_duration = max(0, duration - start_time)
+                    
+                    pause_duration = config.get('pause_duration', self.default_settings['pause_duration'])
+                    total_seconds += play_duration + pause_duration
             
             play_time = now + datetime.timedelta(seconds=total_seconds)
             return play_time.strftime("%H:%M")
@@ -1361,6 +1678,18 @@ class DanceMusicPlayer:
             return now.strftime("%H:%M")
         else:
             return ""
+    
+    def get_play_duration(self, file_path, config):
+        """获取播放时长（统一处理逻辑）"""
+        total_duration = self.get_audio_duration_seconds(file_path)
+        start_time = config.get('start_time', self.default_settings['start_time'])
+        
+        # 如果用户设置了播放时长且大于0，使用设置值
+        if 'play_duration' in config and config['play_duration'] > 0:
+            return config['play_duration']
+        
+        # 否则使用歌曲剩余时长（总时长-起始时间），确保不为负数
+        return max(0, total_duration - start_time)
     
     def update_play_times(self):
         """更新所有歌曲的播放时间"""
@@ -1387,17 +1716,14 @@ class DanceMusicPlayer:
             return duration
         except:
             try:
-                sound = pygame.mixer.Sound(file_path)
-                duration = sound.get_length()
-                return duration
+                audio = mutagen.File(file_path)
+                if audio and hasattr(audio, 'info'):
+                    duration = audio.info.length
+                    if hasattr(self.player, '_length_cache'):
+                        self.player._length_cache[file_path] = duration
+                    return duration
             except:
-                try:
-                    import mutagen
-                    audio = mutagen.File(file_path)
-                    if audio and hasattr(audio, 'info'):
-                        return audio.info.length
-                except:
-                    pass
+                pass
             return 0
     
     def add_song_to_current_playlist(self, song_path):
@@ -1474,6 +1800,7 @@ class DanceMusicPlayer:
             for song in songs:
                 if song in self.song_configs:
                     del self.song_configs[song]
+            self.save_song_configs()
             if playlist_id == self.current_playlist:
                 self.load_playlist(playlist_id)
             self.status_label.config(text="歌曲配置已重置")
@@ -1499,10 +1826,12 @@ class DanceMusicPlayer:
                     duration_str = self.format_time(duration_seconds)
                     
                     config = self.song_configs.get(song, {})
-                    start_time = config.get('start_time', 0)
-                    play_duration = config.get('play_duration', duration_seconds)
-                    pause_duration = config.get('pause_duration', 0)
-                    volume = config.get('volume', 70)
+                    start_time = config.get('start_time', self.default_settings['start_time'])
+                    play_duration = config.get('play_duration', self.default_settings['play_duration'])
+                    pause_duration = config.get('pause_duration', self.default_settings['pause_duration'])
+                    volume = config.get('volume', self.default_settings['volume'])
+                    speed = config.get('speed', self.default_settings['speed'])
+                    pitch = config.get('pitch', self.default_settings['pitch'])
                     light = config.get('light', '')
                     
                     row = (
@@ -1514,6 +1843,8 @@ class DanceMusicPlayer:
                         self.format_time(play_duration),
                         self.format_time(pause_duration),
                         str(volume),
+                        str(speed),
+                        str(pitch),
                         light
                     )
                     self.song_table.insert('', 'end', values=row)
@@ -1563,58 +1894,40 @@ class DanceMusicPlayer:
         """显示设置窗口"""
         settings_window = tk.Toplevel(self.root)
         settings_window.title("设置")
-        settings_window.geometry("300x500")
+        settings_window.geometry("300x550")
         settings_window.transient(self.root)
         settings_window.grab_set()
         
-        # # 歌库目录设置
-        # tk.Label(settings_window, text="歌库目录:", font=('微软雅黑', 12)).pack(pady=5)
-        # tk.Button(settings_window, text="选择目录", command=self.set_library_dir).pack(pady=5)
-        
-        # 默认设置
         tk.Label(settings_window, text="默认歌曲设置:", font=('微软雅黑', 12, 'bold')).pack(pady=10)
         
-        # 默认起始时间
-        tk.Label(settings_window, text="默认起始时间(秒):").pack()
-        self.default_start_time_var = tk.StringVar(value=str(self.default_settings['start_time']))
-        tk.Entry(settings_window, textvariable=self.default_start_time_var, width=20).pack(pady=5)
+        fields = [
+            ("默认起始时间(秒):", 'start_time'),
+            ("默认播放时长(秒, 0=完整):", 'play_duration'),
+            ("默认停顿时长(秒):", 'pause_duration'),
+            ("默认音量(0-100):", 'volume'),
+            ("默认速度(50-150):", 'speed'),
+            ("默认音调(-12到12):", 'pitch'),
+            ("默认滑入参数(秒):", 'fade_in_duration'),
+            ("默认滑出参数(秒):", 'fade_out_duration'),
+        ]
         
-        # 默认播放时长
-        tk.Label(settings_window, text="默认播放时长(秒, 0=完整):").pack()
-        self.default_play_duration_var = tk.StringVar(value=str(self.default_settings['play_duration']))
-        tk.Entry(settings_window, textvariable=self.default_play_duration_var, width=20).pack(pady=5)
-        
-        # 默认停顿时长
-        tk.Label(settings_window, text="默认停顿时长(秒):").pack()
-        self.default_pause_duration_var = tk.StringVar(value=str(self.default_settings['pause_duration']))
-        tk.Entry(settings_window, textvariable=self.default_pause_duration_var, width=20).pack(pady=5)
-        
-        # 默认音量
-        tk.Label(settings_window, text="默认音量(0-100):").pack()
-        self.default_volume_var = tk.StringVar(value=str(self.default_settings['volume']))
-        tk.Entry(settings_window, textvariable=self.default_volume_var, width=20).pack(pady=5)
-        
-        # 滑音参数
-        tk.Label(settings_window, text="滑音参数(秒):").pack()
-        self.fade_out_duration_var = tk.StringVar(value=str(self.default_settings['fade_out_duration']))
-        tk.Entry(settings_window, textvariable=self.fade_out_duration_var, width=20).pack(pady=5)
+        vars_dict = {}
+        for label_text, key in fields:
+            tk.Label(settings_window, text=label_text).pack()
+            var = tk.StringVar(value=str(self.default_settings[key]))
+            tk.Entry(settings_window, textvariable=var, width=12).pack(pady=5)
+            vars_dict[key] = var
 
-        # # 自动播放
-        # auto_play_var = tk.BooleanVar(value=False)
-        # tk.Checkbutton(settings_window, text="启动时自动播放", 
-        #         variable=auto_play_var).pack(pady=10)
-
-        
         # 保存按钮
         def save_settings():
             try:
-                self.default_settings['start_time'] = float(self.default_start_time_var.get())
-                self.default_settings['play_duration'] = float(self.default_play_duration_var.get())
-                self.default_settings['pause_duration'] = float(self.default_pause_duration_var.get())
-                self.default_settings['volume'] = int(self.default_volume_var.get())
-                self.default_settings['fade_out_duration'] = float(self.fade_out_duration_var.get())
+                for key in vars_dict:
+                    if key in ['volume', 'speed', 'pitch']:
+                        self.default_settings[key] = int(vars_dict[key].get())
+                    else:
+                        self.default_settings[key] = float(vars_dict[key].get())
                 
-                # 应用滑音参数
+                self.player.fade_in_duration = self.default_settings['fade_in_duration']
                 self.player.fade_out_duration = self.default_settings['fade_out_duration']
                 
                 self.load_playlist(self.current_playlist)
@@ -1635,6 +1948,10 @@ class DanceMusicPlayer:
             self.status_label.config(text=f"歌库目录已设置为: {folder}")
     
     # ==================== 其他功能 ====================
+    
+    def clean_temp_files(self):
+        self.player.clean_temp_files()
+        self.status_label.config(text="临时文件已清理")
     
     def show_shortcut_settings(self):
         """显示快捷键设置"""
@@ -1723,6 +2040,7 @@ class DanceMusicPlayer:
                 song_path = songs[song_index]
                 if song_path in self.song_configs:
                     del self.song_configs[song_path]
+                    self.save_song_configs()
                     self.load_playlist(self.current_playlist)
                     self.status_label.config(text="歌曲配置已重置")
     
@@ -1742,112 +2060,104 @@ class DanceMusicPlayer:
         
         song_path = songs[song_index]
         config = self.song_configs.get(song_path, {})
+        song_duration = self.get_audio_duration_seconds(song_path)
         
         dialog = tk.Toplevel(self.root)
         dialog.title(f"编辑歌曲: {os.path.basename(song_path)}")
-        dialog.geometry("300x250")
+        dialog.geometry("250x250+600+500")
         dialog.transient(self.root)
         dialog.grab_set()
+
+        # 主容器
+        main_frame = tk.Frame(dialog)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # 左侧编辑区域
+        edit_frame = tk.Frame(main_frame)
+        edit_frame.grid(row=0, column=0, sticky='nsew')
+
+        # 右侧按钮区域
+        button_frame = tk.Frame(main_frame)
+        button_frame.grid(row=0, column=1, sticky='ns', padx=(15, 0))
+
+        # 配置权重
+        main_frame.grid_columnconfigure(0, weight=1)
+        main_frame.grid_columnconfigure(1, weight=0)
+
+        # 输入控件
+        labels = [
+            ("起始时间(秒):", 'start_time', self.default_settings['start_time']),
+            ("播放时长(秒):", 'play_duration', 0),
+            ("停顿时长(秒):", 'pause_duration', self.default_settings['pause_duration']),
+            ("音量(0-100):", 'volume', self.default_settings['volume']),
+            ("速度(50-150):", 'speed', self.default_settings['speed']),
+            ("音调(-12到12):", 'pitch', self.default_settings['pitch']),
+            ("灯光(用脚本):", 'light', ''),
+        ]
         
-        edit_frame = tk.Frame(dialog)
-        edit_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        tk.Label(edit_frame, text="起始时间(秒):").grid(row=0, column=0, sticky='w', pady=5)
-        start_time_var = tk.StringVar(value=str(config.get('start_time', 0)))
-        tk.Entry(edit_frame, textvariable=start_time_var, width=20).grid(row=0, column=1, pady=5)
-        
-        tk.Label(edit_frame, text="播放时长(秒):").grid(row=1, column=0, sticky='w', pady=5)
-        play_duration_var = tk.StringVar(value=str(int(config.get('play_duration', self.get_audio_duration_seconds(song_path)))))
-        tk.Entry(edit_frame, textvariable=play_duration_var, width=20).grid(row=1, column=1, pady=5)
-        
-        tk.Label(edit_frame, text="停顿时长(秒):").grid(row=2, column=0, sticky='w', pady=5)
-        pause_duration_var = tk.StringVar(value=str(config.get('pause_duration', 0)))
-        tk.Entry(edit_frame, textvariable=pause_duration_var, width=20).grid(row=2, column=1, pady=5)
-        
-        tk.Label(edit_frame, text="音量(0-100):").grid(row=3, column=0, sticky='w', pady=5)
-        volume_var = tk.StringVar(value=str(config.get('volume', 70)))
-        tk.Entry(edit_frame, textvariable=volume_var, width=20).grid(row=3, column=1, pady=5)
-        
-        tk.Label(edit_frame, text="灯光:").grid(row=4, column=0, sticky='w', pady=5)
-        light_var = tk.StringVar(value=str(config.get('light', '')))
-        tk.Entry(edit_frame, textvariable=light_var, width=20).grid(row=4, column=1, pady=5)
-        
-        button_frame = tk.Frame(dialog)
-        button_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        def save_config():
+        vars_dict = {}
+        for i, (label_text, key, default_val) in enumerate(labels):
+            tk.Label(edit_frame, text=label_text, anchor='e', width=12).grid(row=i, column=0, sticky='e', pady=4)
+            var = tk.StringVar(value=str(config.get(key, default_val)))
+            tk.Entry(edit_frame, textvariable=var, width=8).grid(row=i, column=1, pady=4, padx=(5, 0))
+            vars_dict[key] = var
+
+        def save_current_config():
+            """保存当前配置，返回是否成功"""
             try:
                 new_config = {
-                    'start_time': float(start_time_var.get()),
-                    'play_duration': int(float(play_duration_var.get())),
-                    'pause_duration': float(pause_duration_var.get()),
-                    'volume': int(volume_var.get()),
-                    'light': light_var.get()
+                    'start_time': float(vars_dict['start_time'].get()),
+                    'play_duration': int(float(vars_dict['play_duration'].get())),
+                    'pause_duration': float(vars_dict['pause_duration'].get()),
+                    'volume': int(vars_dict['volume'].get()),
+                    'speed': int(vars_dict['speed'].get()),
+                    'pitch': int(vars_dict['pitch'].get()),
+                    'light': vars_dict['light'].get()
                 }
                 self.song_configs[song_path] = new_config
+                self.save_song_configs()
                 self.load_playlist(self.current_playlist)
-                # dialog.destroy()  # 删除这行，保存后不关闭窗口
                 self.status_label.config(text="歌曲配置已保存")
-                save_button.config(text="已保存", bg='#27ae60')  # 按钮变绿提示已保存
-                dialog.after(1000, lambda: save_button.config(text="保存", bg='#2ecc71'))  # 1秒后恢复                
-
+                return True
             except ValueError:
                 messagebox.showerror("错误", "请输入有效的数字")
-        
+                return False
+
+        def switch_song(direction):
+            """切换歌曲，direction为-1表示上一首，1表示下一首"""
+            # 先保存当前配置
+            if not save_current_config():
+                return  # 保存失败则不切换
+            
+            new_index = song_index + direction
+            
+            if 0 <= new_index < len(songs):
+                # 有效的索引，切换
+                self.song_table.selection_set(self.song_table.get_children()[new_index])
+                dialog.destroy()
+                self.show_song_edit_dialog()
+            else:
+                # 超出范围
+                if direction > 0:
+                    self.status_label.config(text="已经是最后一首歌曲")
+                    messagebox.showinfo("提示", "已经是最后一首歌曲")
+                else:
+                    self.status_label.config(text="已经是第一首歌曲")
+                    messagebox.showinfo("提示", "已经是第一首歌曲")
+
         def prev_song():
-            if song_index > 0:
-                self.song_table.selection_set(self.song_table.get_children()[song_index - 1])
-                dialog.destroy()
-                self.show_song_edit_dialog()
-        
+            switch_song(-1)
+
         def next_song():
-            if song_index < len(songs) - 1:
-                self.song_table.selection_set(self.song_table.get_children()[song_index + 1])
-                dialog.destroy()
-                self.show_song_edit_dialog()
-        
+            switch_song(1)        
+
+        # 按钮垂直排列(函数必须在使用前定义,不能放在label后)
         tk.Button(button_frame, text="上一曲", command=prev_song, 
-                 bg='#3498db', fg='white', width=10).pack(side=tk.LEFT, padx=5)
+                bg='#3498db', fg='white', width=8).pack(pady=15)
+        tk.Button(button_frame, text="重置", command=self.reset_song_config,
+                bg="#d03434", fg='white', width=8).pack(pady=15)
         tk.Button(button_frame, text="下一曲", command=next_song,
-                 bg='#3498db', fg='white', width=10).pack(side=tk.LEFT, padx=5)
-        # tk.Button(button_frame, text="保存", command=save_config,
-                #  bg='#2ecc71', fg='white', width=10).pack(side=tk.LEFT, padx=5)
-        save_button = tk.Button(button_frame, text="保存", command=save_config,
-                bg='#2ecc71', fg='white', width=10)
-        save_button.pack(side=tk.LEFT, padx=5)        
-    
-    def on_drag_start(self, event):
-        """开始拖动"""
-        item = self.song_table.identify_row(event.y)
-        if item:
-            self.drag_item = item
-            self.song_table.selection_set(item)
-    
-    def on_drag_motion(self, event):
-        """拖动中"""
-        if self.drag_item:
-            target = self.song_table.identify_row(event.y)
-            if target and target != self.drag_item:
-                self.song_table.move(self.drag_item, '', self.song_table.index(target))
-                self.drag_item = target
-    
-    def on_drag_end(self, event):
-        """结束拖动"""
-        if self.drag_item:
-            items = self.song_table.get_children()
-            songs = self.playlist_manager.playlists[self.current_playlist]["songs"]
-            new_songs = []
-            
-            for item in items:
-                values = self.song_table.item(item, 'values')
-                song_index = int(values[0]) - 1
-                if song_index < len(songs):
-                    new_songs.append(songs[song_index])
-            
-            self.playlist_manager.playlists[self.current_playlist]["songs"] = new_songs
-            self.playlist_manager.save_playlists()
-            self.drag_item = None
-            self.load_playlist(self.current_playlist)
+                bg='#3498db', fg='white', width=8).pack(pady=15)
     
     def on_table_double_click(self, event):
         """表格双击事件 - 双击任意位置从头播放"""
@@ -1870,8 +2180,6 @@ class DanceMusicPlayer:
     def get_bpm(self, file_path):
         """使用多种方法检测 BPM，取平均值"""
         try:
-            import numpy as np
-            
             # 加载音频文件
             y, sr = librosa.load(file_path, sr=22050)
             
@@ -2086,7 +2394,7 @@ class DanceMusicPlayer:
     def show_about(self):
         """显示软件信息"""
         messagebox.showinfo("关于", "舞厅舞曲播放编排系统\n\n"
-                          "版本: 1.0.0\n"
+                          "版本: 1.1.0\n"
                           "作者: 魅影制作\n"
                           "版权: © 2026")
     
@@ -2100,7 +2408,8 @@ class DanceMusicPlayer:
                           "5. 使用左右方向键切换上一首/下一首\n"
                           "6. F2减少音量，F3增加音量\n"
                           "7. 右键点击表格可编辑歌曲参数\n"
-                          "8. 右键播放列表可重置该列表所有歌曲配置")
+                          "8. 右键播放列表可重置该列表所有歌曲配置\n"
+                          "9. 速度和音调针对单首歌曲设置")
     
     def check_updates(self):
         """检查更新"""

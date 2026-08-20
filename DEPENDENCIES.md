@@ -1,79 +1,98 @@
 # 项目依赖清单
 
 
-
-## Python 环境
-
-- Python 3.8 或更高版本
+## 📦 核心依赖
+txt
 
 
+<pr># requirements.txt
 
-## Python 库（使用 pip 安装）
+\# 音频播放引擎
+pygame>=2.5.0          # 音频播放、混音器管理
 
-bash
-```
-pip install -r requirements.txt
-```
+\# 音频处理
+librosa>=0.10.0        # 变速变调、BPM检测、音频分析
+soundfile>=0.12.0      # 高质量音频文件读写（WAV/FLAC）
+numpy>=1.24.0          # 数值计算基础库
 
+\# 音频元数据
+mutagen>=1.47.0        # 读取音频文件元信息（时长、比特率等）
 
+\# GUI相关
+Pillow>=10.0.0         # 图像处理（图标、封面）
+</pr>
 
+## 🔧 可选依赖
+txt
 
-# 外部程序（必须单独安装）
+<pr>
+# requirements-optional.txt
 
-## FFmpeg（音频处理核心工具）
+\# 拖放支持
+tkinterdnd2>=0.3.0     # 支持文件拖拽到窗口
+</pr>
 
-1，下载 FFmpeg：https://ffmpeg.org/download.html
-
-
-
-2，Windows 用户选择 Windows Builds（如 gyan.dev 或 BtbN 的版本）
-
-
-
-
-3，解压到本地目录：（例如 C:\\ffmpeg）（请根据实际情况调整）
-
-
-4，将 bin 文件夹路径添加到系统 PATH 环境变量
-
-
-
-5，或者在代码中设置 FFMPEG\_PATH 变量指向 ffmpeg.exe 的完整路径
-
-
-
-**验证安装**
-
-在命令行运行以下命令，确认 FFmpeg 已正确安装：
-
-
+## 📥 一键安装
+**完整安装（包含可选依赖）**
 
 bash
-```
-ffmpeg -version
-```
-**网络要求**
 
-- edge\_tts 和 gTTS 需要互联网连接（调用在线语音服务）
+`pip install -r requirements.txt -r requirements-optional.txt`
+
+**最小安装（仅核心功能）**
+
+bash
+
+`pip install -r requirements.txt`
+
+## 🖥️ 系统依赖
+
+|依赖|	说明|	备注|
+|:---|:---|:---|
+|Python 3.8+	|编程语言运行时|	推荐3.10+|
+|Tkinter	|GUI框架	|Python自带|
+|FFmpeg	|音频解码（可选）	|某些格式需要|
+
+## 📊 依赖关系图
+text
+
+<pr>
+ballroom_player.py
+├── pygame (音频播放)
+│   └── SDL (底层音频库)
+├── librosa (音频处理)
+│   ├── numpy (数值计算)
+│   ├── scipy (科学计算)
+│   └── soundfile (文件读写)
+│       └── libsndfile (底层音频库)
+├── mutagen (元数据)
+├── Pillow (图像)
+└── tkinter (GUI)
+    └── tkinterdnd2 (可选，拖放支持)
+</pr>
+   
 
 
+## ⚡ 快速安装命令
 
-**Windows 特殊说明**
+Windows
 
-- pyttsx3 依赖 Windows SAPI 5 语音引擎（系统自带）
+bash
 
+`pip install pygame librosa soundfile numpy mutagen Pillow tkinterdnd2`
 
+macOS
 
-- 如果使用精简版 Windows，可能需要安装语音包
+bash
 
+`pip3 install pygame librosa soundfile numpy mutagen Pillow tkinterdnd2`
 
+Linux (Ubuntu/Debian)
 
+bash
 
-
-
-
-
-
+`sudo apt-get install python3-tk libsndfile1
+pip3 install pygame librosa soundfile numpy mutagen Pillow tkinterdnd2`
 
 
 
