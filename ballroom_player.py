@@ -21,6 +21,106 @@ import tempfile
 import hashlib
 
 
+class VUMeter(tk.Canvas):
+    """VU表控件类"""
+    def __init__(self, parent, width=30, height=150, bg='#1a1a2e', **kwargs):
+        super().__init__(parent, width=width, height=height, bg=bg, highlightthickness=0, **kwargs)
+        self.width = width
+        self.height = height
+        self.level = 0.0  # 当前电平值 0.0-1.0
+        self.peak_level = 0.0  # 峰值电平
+        self.peak_hold_time = 0  # 峰值保持时间
+        self._draw_vu()
+    
+    def _draw_vu(self):
+        """绘制VU表"""
+        self.delete("all")
+        
+        # 计算绘制区域
+        margin = 5
+        bar_width = self.width - 2 * margin
+        bar_height = self.height - 2 * margin
+        
+        # 绘制背景
+        self.create_rectangle(margin, margin, margin + bar_width, margin + bar_height,
+                            fill='#2a2a3e', outline='#3a3a4e', width=1)
+        
+        # 绘制刻度线
+        num_ticks = 10
+        for i in range(num_ticks + 1):
+            y = margin + bar_height - (i * bar_height / num_ticks)
+            tick_width = 5 if i % 2 == 0 else 3
+            self.create_line(margin, y, margin + tick_width, y, fill='#666666', width=1)
+            
+            # 添加刻度标签
+            if i % 2 == 0:
+                value = int(i * 10)
+                self.create_text(margin + bar_width + 5, y, text=str(value), 
+                               fill='#888888', font=('Arial', 6), anchor='w')
+        
+        # 绘制电平条（从下往上）
+        if self.level > 0:
+            level_height = bar_height * self.level
+            level_y1 = margin + bar_height - level_height
+            level_y2 = margin + bar_height
+            
+            # 根据电平选择颜色
+            if self.level < 0.6:
+                color = '#00ff00'  # 绿色
+            elif self.level < 0.8:
+                color = '#ffff00'  # 黄色
+            else:
+                color = '#ff0000'  # 红色
+            
+            # 绘制渐变效果
+            for y in range(int(level_y1), int(level_y2)):
+                progress = (y - level_y1) / max(1, (level_y2 - level_y1))
+                if progress < 0.6:
+                    color = self._get_gradient_color(progress / 0.6, (0, 255, 0), (255, 255, 0))
+                else:
+                    color = self._get_gradient_color((progress - 0.6) / 0.4, (255, 255, 0), (255, 0, 0))
+                self.create_line(margin + 2, y, margin + bar_width - 2, y, fill=color)
+        
+        # 绘制峰值指示器
+        if self.peak_level > 0:
+            peak_y = margin + bar_height - (bar_height * self.peak_level)
+            self.create_line(margin, peak_y, margin + bar_width, peak_y, 
+                           fill='#ffffff', width=2)
+    
+    def _get_gradient_color(self, progress, color1, color2):
+        """获取渐变色"""
+        # 确保progress在0-1范围内
+        progress = max(0.0, min(1.0, progress))
+        r1, g1, b1 = color1
+        r2, g2, b2 = color2
+        
+        r = int(r1 + (r2 - r1) * progress)
+        g = int(g1 + (g2 - g1) * progress)
+        b = int(b1 + (b2 - b1) * progress)
+        
+        # 确保RGB值在0-255范围内
+        r = max(0, min(255, r))
+        g = max(0, min(255, g))
+        b = max(0, min(255, b))
+        
+        return f'#{r:02x}{g:02x}{b:02x}'
+    
+    def set_level(self, level):
+        """设置电平值"""
+        self.level = max(0.0, min(1.0, level))
+        
+        # 更新峰值
+        if self.level > self.peak_level:
+            self.peak_level = self.level
+            self.peak_hold_time = time.time()
+        
+        # 峰值保持1秒后下降
+        if time.time() - self.peak_hold_time > 1.0:
+            self.peak_level = max(0.0, self.peak_level - 0.02)
+        
+        self._draw_vu()
+
+
 class MusicPlayerCore:
     """音乐播放核心类"""
     def __init__(self):
@@ -48,6 +148,8 @@ class MusicPlayerCore:
         self._auto_next_timer = None
         self._temp_dir = os.path.join(tempfile.gettempdir(), "music_player_temp")
         self._ensure_temp_dir()
+        self._audio_data = None  # 存储音频数据用于VU表
+        self._audio_pos = 0  # 当前音频数据位置
 
     def _ensure_temp_dir(self):
         """确保临时目录存在"""
@@ -104,10 +206,80 @@ class MusicPlayerCore:
         """加载音乐文件"""
         try:
             pygame.mixer.music.load(file_path)
+            # 加载音频数据用于VU表
+            self._load_audio_data(file_path)
             return True
         except Exception as e:
             print(f"加载失败: {e}")
             return False
+    
+    def _load_audio_data(self, file_path):
+        """加载音频数据用于VU表"""
+        try:
+            # 使用librosa加载音频数据
+            y, sr = librosa.load(file_path, sr=22050, mono=False)
+            
+            # 如果是单声道，复制为双声道
+            if len(y.shape) == 1:
+                y = np.stack([y, y])
+            
+            self._audio_data = y
+            self._audio_pos = 0
+            self._audio_sr = sr
+            print(f"音频数据加载成功: {y.shape}, 采样率: {sr}")
+        except Exception as e:
+            print(f"加载音频数据失败: {e}")
+            self._audio_data = None
+    
+    def get_audio_levels(self):
+        """获取当前音频电平数据"""
+        if self._audio_data is None:
+            return 0.0, 0.0
+        
+        try:
+            # 获取当前播放位置对应的音频数据
+            current_pos = self.get_position()
+            sample_pos = int(current_pos * self._audio_sr)
+            
+            # 确保位置有效
+            if sample_pos >= self._audio_data.shape[1]:
+                return 0.0, 0.0
+            
+            # 获取一小段音频数据
+            window_size = 1024
+            end_pos = min(sample_pos + window_size, self._audio_data.shape[1])
+            
+            if end_pos <= sample_pos:
+                return 0.0, 0.0
+            
+            left_channel = self._audio_data[0, sample_pos:end_pos]
+            right_channel = self._audio_data[1, sample_pos:end_pos] if self._audio_data.shape[0] > 1 else left_channel
+            
+            # 计算RMS电平
+            left_rms = np.sqrt(np.mean(left_channel ** 2))
+            right_rms = np.sqrt(np.mean(right_channel ** 2))
+            
+            # 转换为dB并映射到0-1范围
+            left_level = self._rms_to_level(left_rms)
+            right_level = self._rms_to_level(right_rms)
+            
+            return left_level, right_level
+            
+        except Exception as e:
+            print(f"获取音频电平失败: {e}")
+            return 0.0, 0.0
+    
+    def _rms_to_level(self, rms):
+        """将RMS值转换为电平值(0-1)"""
+        if rms < 0.00001:
+            return 0.0
+        
+        # 使用对数刻度映射
+        db = 20 * np.log10(rms)
+
+        # 映射范围：-60dB到0dB
+        level = (db + 60) / 60
+        return max(0.0, min(1.0, level))
     
     def _fade_volume(self, from_vol, to_vol, duration, stop_event=None):
         """通用滑音方法：在指定时间内从from_vol渐变到to_vol"""
@@ -264,12 +436,13 @@ class MusicPlayerCore:
                 pass
     
     def stop(self):
-        """停止播放（带滑出效果）"""
-        if self.is_playing or self.is_paused:
-            self._fade_out_and_stop()
-        else:
-            self._hard_stop()
-    
+        """停止播放（带/不带滑出效果）"""
+        # if self.is_playing or self.is_paused:
+        #     self._fade_out_and_stop()
+        # else:
+        #     self._hard_stop()
+        self._hard_stop()
+
     def _fade_out_and_stop(self):
         """滑出后停止"""
         self._stop_fade = False
@@ -306,6 +479,8 @@ class MusicPlayerCore:
         self.is_playing = False
         self.is_paused = False
         self.current_position = 0
+        self._audio_data = None
+        self._audio_pos = 0
     
     def cancel_auto_next(self):
         """取消自动下一首定时器"""
@@ -473,6 +648,7 @@ class DanceMusicPlayer:
         
         # BPM缓存
         self.bpm_cache = {}
+        self.bpm_threads = {}
         
         # 默认设置
         self.default_settings = {
@@ -504,7 +680,14 @@ class DanceMusicPlayer:
         self.progress_dragging = False
         self._is_transitioning = False       # 防止重复过渡
         self._auto_next_scheduled = False    # 防止重复调度
-        
+
+        # 拖动排序相关变量
+        self._drag_start_index = None  # 拖动开始的索引
+        self._drag_target_index = None  # 拖动目标的索引
+        self._drag_indicator = None  # 拖动指示线
+        self._drag_canvas = None  # 拖动指示线的Canvas
+        self._dragged_item = None  # 拖动的行
+
         self.setup_shortcuts()
         self.setup_drag_drop()
         
@@ -513,6 +696,9 @@ class DanceMusicPlayer:
         
         # 启动进度更新线程
         self.update_progress_thread()
+        
+        # 启动VU表更新线程
+        self.update_vu_meter_thread()
     
     def load_song_configs(self):
         """加载歌曲配置"""
@@ -571,6 +757,7 @@ class DanceMusicPlayer:
         menubar.add_cascade(label="文件", menu=file_menu)
         file_menu.add_command(label="打开文件", command=self.open_files, accelerator="Ctrl+O")
         file_menu.add_command(label="打开文件夹", command=self.open_folder, accelerator="Ctrl+Shift+O")
+        file_menu.add_command(label="导入文件夹到列表", command=self.import_folder_dialog)
         file_menu.add_separator()
         file_menu.add_command(label="快捷键设置", command=self.show_shortcut_settings)
         file_menu.add_command(label="灯光控制", command=self.show_light_control)
@@ -597,9 +784,9 @@ class DanceMusicPlayer:
         self.play_mode_submenu.add_command(label="  随机播放", command=lambda: self.set_play_mode("random"))
         play_menu.add_cascade(label="播放模式 ▸", menu=self.play_mode_submenu)
         
-        # 曲目列表菜单
+        # 播放列表菜单
         tracklist_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="曲目列表", menu=tracklist_menu)
+        menubar.add_cascade(label="播放列表", menu=tracklist_menu)
         tracklist_menu.add_command(label="新建播放列表", command=self.create_new_playlist)
         tracklist_menu.add_separator()
         tracklist_menu.add_command(label="重命名播放列表", command=self.rename_current_playlist)
@@ -643,6 +830,7 @@ class DanceMusicPlayer:
                             width=2, height=1,
                             command=self.play_music)
         self.play_btn.pack(side=tk.LEFT, padx=8)
+        self.bind_hover(self.play_btn, "播放：带滑入播放，使用空格键播放/暂停，使用左右方向键切换上一首/下一首")
         
         # 暂停按钮
         self.pause_btn = tk.Button(left_controls, text="⏸", 
@@ -652,6 +840,7 @@ class DanceMusicPlayer:
                              width=2, height=1,
                              command=self.pause_music)
         self.pause_btn.pack(side=tk.LEFT, padx=8)
+        self.bind_hover(self.pause_btn, "暂停：带滑出暂停，继续播放会在暂停的位置开始播放")
         
         # 停止按钮
         self.stop_btn = tk.Button(left_controls, text="⏹", 
@@ -661,6 +850,7 @@ class DanceMusicPlayer:
                             width=2, height=1,
                             command=self.stop_music)
         self.stop_btn.pack(side=tk.LEFT, padx=8)
+        self.bind_hover(self.stop_btn, "停止：不带滑出的硬停止，点击停止按钮可重头播放舞曲")
         
         # 中间：进度条
         progress_frame = tk.Frame(control_frame, bg='#ecf0f1')
@@ -675,6 +865,7 @@ class DanceMusicPlayer:
         # 进度条（播放过的就是填充色）
         self.progress_bar = ttk.Progressbar(progress_frame, length=400, mode='determinate')
         self.progress_bar.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        self.bind_hover(self.progress_bar, "进度条：仅显示播放时长区段，且时长会随速度快慢而自动增减，无滑块，不可点击拖动调整播放位置")
         
         self.total_time_label = tk.Label(progress_frame, text="00:00", 
                                         bg='#ecf0f1', font=('微软雅黑', 10))
@@ -694,6 +885,29 @@ class DanceMusicPlayer:
                        command=self.change_volume)
         self.volume_scale.set(80)
         self.volume_scale.pack(side=tk.LEFT)
+        self.bind_hover(self.volume_scale, "音量调节：F2减少音量，F3增加音量")
+        
+        # 辅助信息状态栏
+        self.helper_frame = tk.Frame(self.root, bg='#d5dbdb', height=25)
+        self.helper_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+        self.helper_frame.pack_propagate(False)
+        
+        self.helper_label = tk.Label(self.helper_frame, text="", 
+                                    bg='#d5dbdb', fg='#2c3e50',
+                                    font=('微软雅黑', 9),
+                                    anchor='w')
+        self.helper_label.pack(fill=tk.BOTH, expand=True, padx=10)
+        
+    def bind_hover(self, widget, text):
+        """为控件绑定悬停事件"""
+        def on_enter(event):
+            self.helper_label.config(text=text)
+        
+        def on_leave(event):
+            self.helper_label.config(text="")
+        
+        widget.bind('<Enter>', on_enter)
+        widget.bind('<Leave>', on_leave)
         
     def create_main_content(self):
         """创建主要内容区域（使用PanedWindow实现可调整大小）"""
@@ -715,6 +929,7 @@ class DanceMusicPlayer:
         self.folder_tree = ttk.Treeview(folder_container, selectmode='browse')
         self.folder_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.folder_tree.heading('#0', text='文件夹', anchor='w')
+        self.bind_hover(self.folder_tree, "歌库文件夹列表：单击文件即可快速添加到当前播放列表，菜单栏【文件】-【导入文件夹到列表】可将文件夹内所有音乐添加到当前播放列表")
         
         # 添加滚动条
         folder_scrollbar = ttk.Scrollbar(folder_container, orient="vertical", 
@@ -792,33 +1007,46 @@ class DanceMusicPlayer:
         self.song_table.column('速度', width=30, anchor='center')
         self.song_table.column('音调', width=30, anchor='center')
         self.song_table.column('灯光', width=20, anchor='center')
+
         # 添加垂直滚动条
         table_vscrollbar = ttk.Scrollbar(container, orient="vertical", 
                                         command=self.song_table.yview)
         self.song_table.configure(yscrollcommand=table_vscrollbar.set)
+
         # 添加水平滚动条
         table_hscrollbar = ttk.Scrollbar(container, orient="horizontal", 
                                         command=self.song_table.xview)
         self.song_table.configure(xscrollcommand=table_hscrollbar.set)
+
         # 布局表格和滚动条
         self.song_table.grid(row=0, column=0, sticky='nsew')
         table_vscrollbar.grid(row=0, column=1, sticky='ns')
         table_hscrollbar.grid(row=1, column=0, sticky='ew')
+
         # 配置网格权重
         container.grid_rowconfigure(0, weight=1)
         container.grid_columnconfigure(0, weight=1)
+
         # 绑定鼠标点击事件        
         self.song_table.bind('<Double-1>', self.on_table_double_click)
         self.song_table.bind('<Button-3>', self.show_table_context_menu)
         self.song_table.bind('<<TreeviewSelect>>', self.on_song_select)
+        self.bind_hover(self.song_table, "舞曲编排表格：双击播放，拖动舞曲可以调整播放次序，右键菜单进行管理")
+
+        # 绑定拖动排序事件
+        self.song_table.bind('<Button-1>', self.on_table_drag_start)
+        self.song_table.bind('<B1-Motion>', self.on_table_drag_motion)
+        self.song_table.bind('<ButtonRelease-1>', self.on_table_drag_end)
 
     def create_audio_controls(self, container):
         """创建音频控制"""
         # 左：七段均衡器
         eq_frame = tk.Frame(container, bg='white', relief=tk.GROOVE, borderwidth=1)
         eq_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
         # 👇 新增：为均衡器绑定右键菜单
         eq_frame.bind('<Button-3>', self.show_eq_context_menu)
+        self.bind_hover(eq_frame, "七段均衡器：均衡效果仅对当前舞曲有效，并自动保存到舞曲中，右键可重置")
                 
         eq_frequencies = ['60Hz', '150Hz', '400Hz', '1kHz', '2.4kHz', '6kHz', '15kHz']
         self.eq_sliders = []
@@ -835,14 +1063,25 @@ class DanceMusicPlayer:
             slider.set(0)
             slider.pack()
             self.eq_sliders.append(slider)
+            self.bind_hover(slider, f"均衡器 {freq}")
             
             tk.Label(slider_frame, text=freq, bg='white', font=('微软雅黑', 8)).pack()
         
+        # 左声道VU表（独立frame）
+        left_vu_frame = tk.Frame(container, bg="#f9fbfc", relief=tk.GROOVE, borderwidth=1)
+        left_vu_frame.pack(side=tk.LEFT, fill=tk.NONE, padx=2, pady=5)
+        tk.Label(left_vu_frame, text="L", bg="#f9fbfc",fg='#0B0B0B', 
+                font=('Arial', 8, 'bold')).pack(side=tk.TOP, pady=1)
+        self.left_vu_meter = VUMeter(left_vu_frame, width=20, height=80, bg="#0B0B0B")
+        self.left_vu_meter.pack(side=tk.TOP, pady=5, padx=5)
+        self.bind_hover(self.left_vu_meter, "左声道VU表")
+
         # 中：音频调节
         tempo_frame = tk.Frame(container, bg='white', relief=tk.GROOVE, borderwidth=1)
         tempo_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
         # 👇 新增：为音频调节绑定右键菜单
         tempo_frame.bind('<Button-3>', self.show_tempo_context_menu)
+        self.bind_hover(tempo_frame, "音频调节：变速不变调，变调不变速，仅对当前舞曲有效，并自动保存到舞曲中，右键可重置")
 
         # 节拍滑块
         tk.Label(tempo_frame, text="节拍", bg='white').pack(anchor='c', pady=(0, 0))
@@ -851,6 +1090,7 @@ class DanceMusicPlayer:
                                     command=self.on_beat_change)
         self.beat_slider.set(90)
         self.beat_slider.pack(pady=(0, 5), fill=tk.X, padx=5)
+        self.bind_hover(self.beat_slider, "节拍调节")
 
         # 速度滑块
         tk.Label(tempo_frame, text="速度", bg='white').pack(anchor='c', pady=(0, 0))
@@ -859,6 +1099,7 @@ class DanceMusicPlayer:
                                     command=self.on_speed_change)
         self.speed_slider.set(100)
         self.speed_slider.pack(pady=(0, 5), fill=tk.X, padx=5)
+        self.bind_hover(self.speed_slider, "速度调节")
 
         # 音调滑块
         tk.Label(tempo_frame, text="音调", bg='white').pack(anchor='c', pady=(0, 0))
@@ -867,14 +1108,61 @@ class DanceMusicPlayer:
                                     command=self.on_pitch_change)
         self.pitch_slider.set(0)
         self.pitch_slider.pack(pady=(0, 5), fill=tk.X, padx=5)
+        self.bind_hover(self.pitch_slider, "音调调节")
+
+        # 右声道VU表（独立frame）
+        right_vu_frame = tk.Frame(container, bg="#f9fbfc", relief=tk.GROOVE, borderwidth=1)
+        right_vu_frame.pack(side=tk.LEFT, fill=tk.NONE, padx=2, pady=5)
+        tk.Label(right_vu_frame, text="R", bg='#f9fbfc', fg="#0B0B0B", 
+                font=('Arial', 8, 'bold')).pack(side=tk.TOP, pady=1)
+        self.right_vu_meter = VUMeter(right_vu_frame, width=20, height=80, bg='#0B0B0B')
+        self.right_vu_meter.pack(side=tk.TOP, pady=5, padx=5)
+        self.bind_hover(self.right_vu_meter, "右声道VU表")
 
         # 右：歌曲信息
         metadata_frame = tk.Frame(container, bg='white', relief=tk.GROOVE, borderwidth=1)
         metadata_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-                
+        self.bind_hover(metadata_frame, "歌曲信息")
+
         self.metadata_text = tk.Text(metadata_frame, font=('微软雅黑', 9), 
                                     bg='#f8f9fa', wrap=tk.WORD, height=15)
         self.metadata_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.bind_hover(self.metadata_text, "歌曲元数据信息")
+
+    def update_vu_meter_thread(self):
+        """更新VU表线程"""
+        def update_vu():
+            while True:
+                try:
+                    if self.player.is_playing and not self.player.is_paused:
+                        # 获取真实的音频电平数据
+                        left_level, right_level = self.player.get_audio_levels()
+                        
+                        # 根据音量调整电平
+                        volume_factor = self.player.volume / 100.0
+                        left_level *= volume_factor
+                        right_level *= volume_factor
+                        
+                        # 在主线程中更新VU表
+                        self.root.after(0, self.update_vu_meters, left_level, right_level)
+                    else:
+                        # 不播放时VU表归零
+                        self.root.after(0, self.update_vu_meters, 0.0, 0.0)
+                except Exception as e:
+                    print(f"VU表更新错误: {e}")
+                
+                time.sleep(0.05)  # 每0.05秒更新一次，提高响应速度
+        
+        thread = threading.Thread(target=update_vu, daemon=True)
+        thread.start()
+    
+    def update_vu_meters(self, left_level, right_level):
+        """更新VU表显示"""
+        try:
+            self.left_vu_meter.set_level(left_level)
+            self.right_vu_meter.set_level(right_level)
+        except Exception as e:
+            print(f"更新VU表显示错误: {e}")
 
     def show_eq_context_menu(self, event):
         """显示七段均衡器的右键菜单"""
@@ -910,6 +1198,7 @@ class DanceMusicPlayer:
             btn.pack(side=tk.LEFT, padx=5, pady=5)
             btn.bind('<Button-3>', lambda e, id=playlist_id: self.show_playlist_context_menu(e, id))
             self.playlist_buttons[playlist_id] = btn
+            self.bind_hover(btn, f"播放列表: {playlist_data['name']}，右键菜单进行管理")
 
     def create_status_bar(self):
         """创建底部状态栏"""
@@ -1163,7 +1452,20 @@ class DanceMusicPlayer:
             self.load_playlist(self.current_playlist)
             self.load_folder_tree(folder)
             self.status_label.config(text=f"已从文件夹添加 {len(music_files)} 个文件")
-    
+
+    def import_folder_dialog(self):
+        """导入文件夹对话框 - 将文件夹内所有音乐添加到当前播放列表"""
+        folder = filedialog.askdirectory(title="选择音乐文件夹")
+        if folder:
+            music_files = self.scan_music_files(folder)
+            if music_files:
+                for file in music_files:
+                    self.add_song_to_current_playlist(file)
+                self.load_playlist(self.current_playlist)
+                self.status_label.config(text=f"已从文件夹添加 {len(music_files)} 个文件")
+            else:
+                self.status_label.config(text="该文件夹中没有找到音乐文件")
+
     def scan_music_files(self, folder):
         """扫描文件夹中的音乐文件"""
         music_extensions = ['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg']
@@ -1456,7 +1758,8 @@ class DanceMusicPlayer:
         self.player.cancel_auto_next()
         
         if self.player.is_playing or self.player.is_paused:
-            self.player.stop()  # 带滑音停止,假设player.stop()内部已经处理了滑音
+            self.player.stop()  # 带滑音停止,假设player.stop()内部已经处理了滑音，未处理就不带
+        # self.player.stop(immediate=True)    # 没有immediate 参数，可能需要重新初始化播放器或调用底层 API
         self.status_label.config(text="停止播放")
         self.progress_bar['value'] = 0
         self.current_time_label.config(text="00:00")
@@ -2064,7 +2367,7 @@ class DanceMusicPlayer:
         
         dialog = tk.Toplevel(self.root)
         dialog.title(f"编辑歌曲: {os.path.basename(song_path)}")
-        dialog.geometry("250x250+600+500")
+        dialog.geometry("250x250+635+365")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -2168,7 +2471,112 @@ class DanceMusicPlayer:
             song_index = int(values[0]) - 1
             # 从头播放
             self.play_song_by_index(song_index)
-    
+
+    def on_table_drag_start(self, event):
+        """表格拖动开始"""
+        # 获取点击的行
+        item = self.song_table.identify_row(event.y)
+        if item:
+            self._drag_start_index = self.song_table.index(item)
+            self._drag_target_index = self._drag_start_index
+            # 记录拖动的行
+            self._dragged_item = item
+
+    def on_table_drag_motion(self, event):
+        """表格拖动过程中"""
+        if self._drag_start_index is None:
+            return
+        
+        # 获取当前鼠标所在的行
+        target_item = self.song_table.identify_row(event.y)
+        if target_item:
+            target_index = self.song_table.index(target_item)
+            
+            # 如果目标位置改变，更新指示线
+            if target_index != self._drag_target_index:
+                self._drag_target_index = target_index
+                self.show_drag_indicator(target_index, event.y)
+
+    def on_table_drag_end(self, event):
+        """表格拖动结束"""
+        if self._drag_start_index is None:
+            return
+        
+        # 获取释放位置的行
+        target_item = self.song_table.identify_row(event.y)
+        if target_item:
+            target_index = self.song_table.index(target_item)
+            
+            # 如果位置有变化，执行移动
+            if target_index != self._drag_start_index:
+                self.move_song_in_playlist(self._drag_start_index, target_index)
+        
+        # 清除拖动指示线
+        self.clear_drag_indicator()
+        
+        # 重置拖动变量
+        self._drag_start_index = None
+        self._drag_target_index = None
+        self._dragged_item = None
+
+    def show_drag_indicator(self, target_index, y_pos):
+        """显示拖动指示（使用行高亮）"""
+        self.clear_drag_indicator()
+        
+        # 获取目标行的位置
+        items = self.song_table.get_children()
+        if target_index < len(items):
+            target_item = items[target_index]
+            bbox = self.song_table.bbox(target_item)
+            if bbox:
+                x, y, width, height = bbox
+                
+                # 判断是在目标行的上方还是下方
+                if y_pos < y + height / 2:
+                    # 在上方时，高亮当前行
+                    self.song_table.item(target_item, tags=('drag_target',))
+                    if target_index > 0:
+                        # 同时清除上一行的高亮
+                        prev_item = items[target_index - 1]
+                        self.song_table.item(prev_item, tags=())
+                else:
+                    # 在下方时，高亮当前行
+                    self.song_table.item(target_item, tags=('drag_target',))
+                    if target_index < len(items) - 1:
+                        # 同时清除下一行的高亮
+                        next_item = items[target_index + 1]
+                        self.song_table.item(next_item, tags=())
+                
+                # 配置drag_target标签的样式
+                self.song_table.tag_configure('drag_target', background='#ffcccc')
+
+    def clear_drag_indicator(self):
+        """清除拖动指示"""
+        # 清除所有行的drag_target标签
+        items = self.song_table.get_children()
+        for item in items:
+            self.song_table.item(item, tags=())
+        self._drag_indicator = None
+
+    def move_song_in_playlist(self, from_index, to_index):
+        """在播放列表中移动歌曲"""
+        songs = self.playlist_manager.playlists[self.current_playlist]["songs"]
+        
+        if 0 <= from_index < len(songs) and 0 <= to_index < len(songs):
+            # 使用PlaylistManager的move_song方法
+            if self.playlist_manager.move_song(self.current_playlist, from_index, to_index):
+                # 重新加载播放列表
+                self.load_playlist(self.current_playlist)
+                self.status_label.config(text="歌曲顺序已调整")
+                
+                # 如果移动的是当前播放的歌曲，更新当前索引
+                if self.player.current_index == from_index:
+                    self.player.current_index = to_index
+                elif from_index < self.player.current_index <= to_index:
+                    self.player.current_index -= 1
+                elif to_index <= self.player.current_index < from_index:
+                    self.player.current_index += 1
+
     def update_status_position(self):
         """更新当前播放位置信息"""
         if self.player.current_index >= 0:
@@ -2394,22 +2802,16 @@ class DanceMusicPlayer:
     def show_about(self):
         """显示软件信息"""
         messagebox.showinfo("关于", "舞厅舞曲播放编排系统\n\n"
-                          "版本: 1.1.0\n"
+                          "版本: 1.2.0\n"
                           "作者: 魅影制作\n"
                           "版权: © 2026")
     
     def show_help(self):
         """显示帮助"""
         messagebox.showinfo("帮助", "使用说明:\n\n"
-                          "1. 单击或拖拽文件到窗口快速添加\n"
-                          "2. 双击歌曲行播放歌曲\n"
-                          "3. 点击停止按钮可重头播放歌曲\n"
-                          "4. 使用空格键播放/暂停\n"
-                          "5. 使用左右方向键切换上一首/下一首\n"
-                          "6. F2减少音量，F3增加音量\n"
-                          "7. 右键点击表格可编辑歌曲参数\n"
-                          "8. 右键播放列表可重置该列表所有歌曲配置\n"
-                          "9. 速度和音调针对单首歌曲设置")
+                          "1. 单曲重置配置：右键点击表格里歌曲仅针对单曲编辑和重置\n"
+                          "2. 列表重置配置：右键播放列表可重置该列表所有歌曲配置\n"
+                          "3. 鼠标悬停会有详细的提示帮助")
     
     def check_updates(self):
         """检查更新"""

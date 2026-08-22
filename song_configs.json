@@ -3,7 +3,7 @@
     "start_time": 150.0,
     "play_duration": 0,
     "pause_duration": 0.0,
-    "volume": 2,
+    "volume": 49,
     "speed": 61,
     "pitch": 0,
     "light": ""
@@ -13,7 +13,7 @@
     "play_duration": 8,
     "pause_duration": 0.0,
     "volume": 31,
-    "speed": 100,
+    "speed": 71,
     "pitch": 0,
     "light": ""
   },
@@ -21,7 +21,7 @@
     "start_time": 0.0,
     "play_duration": 21,
     "pause_duration": 8.0,
-    "volume": 75,
+    "volume": 53,
     "speed": 125,
     "pitch": 0,
     "light": ""
@@ -41,7 +41,97 @@
     "pause_duration": 0.0,
     "volume": 62,
     "light": "",
-    "speed": 132,
-    "pitch": 0
+    "speed": 73,
+    "pitch": 5
+  },
+  "C:/jerome/DANCE\\音频素材\\000-轻d开场-纯音乐-信仰.mp3": {
+    "volume": 80
+  },
+  "C:/jerome/DANCE\\音频素材\\66-轻w结束-A Little Story - Valentin.flac": {
+    "volume": 80
+  },
+  "C:/jerome/DANCE/音频素材\\00-广州星发舞厅_温馨提示_女声_加背景乐.mp3": {
+    "volume": 80
+  },
+  "C:/jerome/DANCE/音频素材\\atlasaudio-piano-emotional-509975.mp3": {
+    "start_time": 8.0,
+    "play_duration": 0,
+    "pause_duration": 0.0,
+    "volume": 80,
+    "speed": 100,
+    "pitch": 0,
+    "light": ""
+  },
+  "C:/jerome/DANCE/音频素材\\motion_outro-bgm.mp3": {
+    "start_time": 0.0,
+    "play_duration": 8,
+    "pause_duration": 0.0,
+    "volume": 80,
+    "speed": 100,
+    "pitch": 0,
+    "light": ""
+  },
+  "C:/jerome/DANCE/音频素材\\shorts_by_pazuzustudio-classical-period-drama-piano-waltz-30s-528720.mp3": {
+    "start_time": 0.0,
+    "play_duration": 0,
+    "pause_duration": 8.0,
+    "volume": 80,
+    "speed": 100,
+    "pitch": 0,
+    "light": ""
+  },
+  "C:/jerome/DANCE/音频素材\\shorts_by_pazuzustudio-elegant-historical-waltz-piano-528721.mp3": {
+    "start_time": 0.0,
+    "play_duration": 0,
+    "pause_duration": 0.0,
+    "volume": 8,
+    "speed": 100,
+    "pitch": 0,
+    "light": ""
+  },
+  "C:/jerome/DANCE/音频素材\\广州星发舞厅_温馨提示_女声.mp3": {
+    "start_time": 0.0,
+    "play_duration": 0,
+    "pause_duration": 0.0,
+    "volume": 80,
+    "speed": 8,
+    "pitch": 0,
+    "light": ""
+  },
+  "C:/jerome/DANCE/音频素材\\广州星发舞厅_结束语_女声.mp3": {
+    "start_time": 0.0,
+    "play_duration": 0,
+    "pause_duration": 0.0,
+    "volume": 80,
+    "speed": 100,
+    "pitch": 8,
+    "light": ""
+  },
+  "C:/jerome/DANCE/音频素材\\轻d背景-《羊了个羊🐏》，第二关大家都过了吗？bgm.mp3": {
+    "start_time": 0.0,
+    "play_duration": 0,
+    "pause_duration": 0.0,
+    "volume": 80,
+    "speed": 100,
+    "pitch": 0,
+    "light": "8"
+  },
+  "C:/jerome/DANCE/音频素材\\配温馨提示penguinmusic-future-design-344320.mp3": {
+    "start_time": 0.0,
+    "play_duration": 0,
+    "pause_duration": 0.0,
+    "volume": 80,
+    "speed": 100,
+    "pitch": 0,
+    "light": ""
+  },
+  "C:/jerome/DANCE/音频素材\\轻w背景-ふたりの気持ち - 和田薫bgm.flac": {
+    "start_time": 0.0,
+    "play_duration": 0,
+    "pause_duration": 0.0,
+    "volume": 80,
+    "speed": 100,
+    "pitch": 0,
+    "light": ""
   }
 }
