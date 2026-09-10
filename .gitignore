@@ -9,7 +9,13 @@ env/
 venv/
 vendor/
 zz/
+bgm/
 playlists_config.json
+
+
+*.spec
+*.json
+
 
 # Local env files
 .env

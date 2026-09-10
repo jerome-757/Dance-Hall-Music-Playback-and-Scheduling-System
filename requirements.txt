@@ -1,9 +1,11 @@
-librosa==0.11.0
+edge-tts==7.2.8
+gTTS==2.5.4
+librosa==1.0.0
 mutagen==1.48.1
-numpy==1.19.2
-Pillow==8.0.1
-Pillow==12.3.0
+pillow==12.3.0
+pip==24.2
 pygame==2.6.1
+pyinstaller==6.22.2
+pyttsx3==2.99
 sounddevice==0.5.6
-soundfile==0.14.0
 tkinterdnd2==0.6.2

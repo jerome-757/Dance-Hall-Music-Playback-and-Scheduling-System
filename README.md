@@ -10,7 +10,7 @@
 
 ## 界面预览
 
-![程序界面截图](./images/ballroom_player_v1.2.0.png)
+![程序界面截图](./images/ballroom_player_v1.3.0.png)
 
 # 🎵 舞厅舞曲播放编排系统-魅影制作
 
